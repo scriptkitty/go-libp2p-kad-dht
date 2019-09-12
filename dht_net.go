@@ -44,6 +44,10 @@ var writerPool = sync.Pool{
 	},
 }
 
+func WriteMsg(w io.Writer, mes *pb.Message) error {
+	return writeMsg(w, mes)
+}
+
 func writeMsg(w io.Writer, mes *pb.Message) error {
 	bw := writerPool.Get().(*bufferedDelimitedWriter)
 	bw.Reset(w)
