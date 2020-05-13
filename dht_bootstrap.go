@@ -2,35 +2,34 @@ package dht
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"time"
 
+	multierror "github.com/hashicorp/go-multierror"
+	process "github.com/jbenet/goprocess"
+	processctx "github.com/jbenet/goprocess/context"
 	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/routing"
-
-	u "github.com/ipfs/go-ipfs-util"
+	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/multiformats/go-multiaddr"
-	_ "github.com/multiformats/go-multiaddr-dns"
 )
 
+// DefaultBootstrapPeers is a set of public DHT bootstrap peers provided by libp2p.
 var DefaultBootstrapPeers []multiaddr.Multiaddr
+
+// Minimum number of peers in the routing table. If we drop below this and we
+// see a new peer, we trigger a bootstrap round.
+var minRTRefreshThreshold = 10
+
+// timeout for pinging one peer
+const peerPingTimeout = 10 * time.Second
 
 func init() {
 	for _, s := range []string{
-		"/dnsaddr/bootstrap.libp2p.io/ipfs/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-		"/dnsaddr/bootstrap.libp2p.io/ipfs/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-		"/dnsaddr/bootstrap.libp2p.io/ipfs/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-		"/dnsaddr/bootstrap.libp2p.io/ipfs/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-		"/ip4/104.131.131.82/tcp/4001/ipfs/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",            // mars.i.ipfs.io
-		"/ip4/104.236.179.241/tcp/4001/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",           // pluto.i.ipfs.io
-		"/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",           // saturn.i.ipfs.io
-		"/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",             // venus.i.ipfs.io
-		"/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd",            // earth.i.ipfs.io
-		"/ip6/2604:a880:1:20::203:d001/tcp/4001/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",  // pluto.i.ipfs.io
-		"/ip6/2400:6180:0:d0::151:6001/tcp/4001/ipfs/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",  // saturn.i.ipfs.io
-		"/ip6/2604:a880:800:10::4a:5001/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64", // venus.i.ipfs.io
-		"/ip6/2a03:b0c0:0:1010::23:1001/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd", // earth.i.ipfs.io
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ", // mars.i.ipfs.io
 	} {
 		ma, err := multiaddr.NewMultiaddr(s)
 		if err != nil {
@@ -40,121 +39,160 @@ func init() {
 	}
 }
 
-// BootstrapConfig specifies parameters used bootstrapping the DHT.
-//
-// Note there is a tradeoff between the bootstrap period and the
-// number of queries. We could support a higher period with less
-// queries.
-type BootstrapConfig struct {
-	Queries int           // how many queries to run per period
-	Period  time.Duration // how often to run periodic bootstrap.
-	Timeout time.Duration // how long to wait for a bootstrap query to run
-}
-
-var DefaultBootstrapConfig = BootstrapConfig{
-	// For now, this is set to 1 query.
-	// We are currently more interested in ensuring we have a properly formed
-	// DHT than making sure our dht minimizes traffic. Once we are more certain
-	// of our implementation's robustness, we should lower this down to 8 or 4.
-	Queries: 1,
-
-	// For now, this is set to 5 minutes, which is a medium period. We are
-	// We are currently more interested in ensuring we have a properly formed
-	// DHT than making sure our dht minimizes traffic.
-	Period: time.Duration(5 * time.Minute),
-
-	Timeout: time.Duration(10 * time.Second),
-}
-
-// A method in the IpfsRouting interface. It calls BootstrapWithConfig with
-// the default bootstrap config.
-func (dht *IpfsDHT) Bootstrap(ctx context.Context) error {
-	return dht.BootstrapWithConfig(ctx, DefaultBootstrapConfig)
-}
-
-// Runs cfg.Queries bootstrap queries every cfg.Period.
-func (dht *IpfsDHT) BootstrapWithConfig(ctx context.Context, cfg BootstrapConfig) error {
-	// Because this method is not synchronous, we have to duplicate sanity
-	// checks on the config so that callers aren't oblivious.
-	if cfg.Queries <= 0 {
-		return fmt.Errorf("invalid number of queries: %d", cfg.Queries)
-	}
-	go func() {
+// startSelfLookup starts a go-routine that listens for requests to trigger a self walk on a dedicated channel
+// and then sends the error status back on the error channel sent along with the request.
+// if multiple callers "simultaneously" ask for a self walk, it performs ONLY one self walk and sends the same error status to all of them.
+func (dht *IpfsDHT) startSelfLookup() {
+	dht.proc.Go(func(proc process.Process) {
+		ctx := processctx.WithProcessClosing(dht.ctx, proc)
 		for {
-			err := dht.runBootstrap(ctx, cfg)
-			if err != nil {
-				logger.Warningf("error bootstrapping: %s", err)
-			}
+			var waiting []chan<- error
 			select {
-			case <-time.After(cfg.Period):
+			case res := <-dht.triggerSelfLookup:
+				if res != nil {
+					waiting = append(waiting, res)
+				}
 			case <-ctx.Done():
 				return
 			}
+
+			// batch multiple refresh requests if they're all waiting at the same time.
+			waiting = append(waiting, collectWaitingChannels(dht.triggerSelfLookup)...)
+
+			// Do a self walk
+			queryCtx, cancel := context.WithTimeout(ctx, dht.rtRefreshQueryTimeout)
+			_, err := dht.GetClosestPeers(queryCtx, string(dht.self))
+			if err == kbucket.ErrLookupFailure {
+				err = nil
+			} else if err != nil {
+				err = fmt.Errorf("failed to query self during routing table refresh: %s", err)
+			}
+			cancel()
+
+			// send back the error status
+			for _, w := range waiting {
+				w <- err
+				close(w)
+			}
+			if err != nil {
+				logger.Warnw("self lookup failed", "error", err)
+			}
 		}
-	}()
-	return nil
+	})
 }
 
-// This is a synchronous bootstrap. cfg.Queries queries will run each with a
-// timeout of cfg.Timeout. cfg.Period is not used.
-func (dht *IpfsDHT) BootstrapOnce(ctx context.Context, cfg BootstrapConfig) error {
-	if cfg.Queries <= 0 {
-		return fmt.Errorf("invalid number of queries: %d", cfg.Queries)
+// Start the refresh worker.
+func (dht *IpfsDHT) startRefreshing() {
+	// scan the RT table periodically & do a random walk for cpl's that haven't been queried since the given period
+	dht.proc.Go(func(proc process.Process) {
+		ctx := processctx.WithProcessClosing(dht.ctx, proc)
+
+		refreshTicker := time.NewTicker(dht.rtRefreshInterval)
+		defer refreshTicker.Stop()
+
+		// refresh if option is set
+		if dht.autoRefresh {
+			err := dht.doRefresh(ctx)
+			if err != nil {
+				logger.Warn("failed when refreshing routing table", err)
+			}
+		} else {
+			// disable the "auto-refresh" ticker so that no more ticks are sent to this channel
+			refreshTicker.Stop()
+		}
+
+		for {
+			var waiting []chan<- error
+			select {
+			case <-refreshTicker.C:
+			case res := <-dht.triggerRtRefresh:
+				if res != nil {
+					waiting = append(waiting, res)
+				}
+			case <-ctx.Done():
+				return
+			}
+
+			// Batch multiple refresh requests if they're all waiting at the same time.
+			waiting = append(waiting, collectWaitingChannels(dht.triggerRtRefresh)...)
+
+			err := dht.doRefresh(ctx)
+			for _, w := range waiting {
+				w <- err
+				close(w)
+			}
+			if err != nil {
+				logger.Warnw("failed when refreshing routing table", "error", err)
+			}
+
+			// ping Routing Table peers that haven't been hear of/from in the interval they should have been.
+			for _, ps := range dht.routingTable.GetPeerInfos() {
+				// ping the peer if it's due for a ping and evict it if the ping fails
+				if time.Since(ps.LastSuccessfulOutboundQueryAt) > dht.successfulOutboundQueryGracePeriod {
+					livelinessCtx, cancel := context.WithTimeout(ctx, peerPingTimeout)
+					if err := dht.host.Connect(livelinessCtx, peer.AddrInfo{ID: ps.Id}); err != nil {
+						logger.Debugw("evicting peer after failed ping", "peer", ps.Id, "error", err)
+						dht.routingTable.RemovePeer(ps.Id)
+					}
+					cancel()
+				}
+			}
+
+		}
+	})
+}
+
+func collectWaitingChannels(source chan chan<- error) []chan<- error {
+	var waiting []chan<- error
+	for {
+		select {
+		case res := <-source:
+			if res != nil {
+				waiting = append(waiting, res)
+			}
+		default:
+			return waiting
+		}
 	}
-	return dht.runBootstrap(ctx, cfg)
 }
 
-func newRandomPeerId() peer.ID {
-	id := make([]byte, 32) // SHA256 is the default. TODO: Use a more canonical way to generate random IDs.
-	rand.Read(id)
-	id = u.Hash(id) // TODO: Feed this directly into the multihash instead of hashing it.
-	return peer.ID(id)
-}
+func (dht *IpfsDHT) doRefresh(ctx context.Context) error {
+	var merr error
 
-// Traverse the DHT toward the given ID.
-func (dht *IpfsDHT) walk(ctx context.Context, target peer.ID) (peer.AddrInfo, error) {
-	// TODO: Extract the query action (traversal logic?) inside FindPeer,
-	// don't actually call through the FindPeer machinery, which can return
-	// things out of the peer store etc.
-	return dht.FindPeer(ctx, target)
-}
+	// wait for the self walk result
+	selfWalkres := make(chan error, 1)
 
-// Traverse the DHT toward a random ID.
-func (dht *IpfsDHT) randomWalk(ctx context.Context) error {
-	id := newRandomPeerId()
-	p, err := dht.walk(ctx, id)
-	switch err {
-	case routing.ErrNotFound:
-		return nil
-	case nil:
-		// We found a peer from a randomly generated ID. This should be very
-		// unlikely.
-		logger.Warningf("random walk toward %s actually found peer: %s", id, p)
-		return nil
-	default:
-		return err
+	select {
+	case dht.triggerSelfLookup <- selfWalkres:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-}
 
-// Traverse the DHT toward the self ID
-func (dht *IpfsDHT) selfWalk(ctx context.Context) error {
-	_, err := dht.walk(ctx, dht.self)
-	if err == routing.ErrNotFound {
-		return nil
+	select {
+	case err := <-selfWalkres:
+		if err != nil {
+			merr = multierror.Append(merr, err)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return err
+
+	if err := dht.refreshCpls(ctx); err != nil {
+		merr = multierror.Append(merr, err)
+	}
+	return merr
 }
 
-// runBootstrap builds up list of peers by requesting random peer IDs
-func (dht *IpfsDHT) runBootstrap(ctx context.Context, cfg BootstrapConfig) error {
-	doQuery := func(n int, target string, f func(context.Context) error) error {
-		logger.Infof("starting bootstrap query (%d/%d) to %s (routing table size was %d)",
-			n, cfg.Queries, target, dht.routingTable.Size())
+// refreshCpls scans the routing table, and does a random walk for cpl's that haven't been queried since the given period
+func (dht *IpfsDHT) refreshCpls(ctx context.Context) error {
+	doQuery := func(cpl uint, target string, f func(context.Context) error) error {
+		logger.Infof("starting refreshing cpl %d to %s (routing table size was %d)",
+			cpl, target, dht.routingTable.Size())
 		defer func() {
-			logger.Infof("finished bootstrap query (%d/%d) to %s (routing table size is now %d)",
-				n, cfg.Queries, target, dht.routingTable.Size())
+			logger.Infof("finished refreshing cpl %d to %s (routing table size is now %d)",
+				cpl, target, dht.routingTable.Size())
 		}()
-		queryCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+		queryCtx, cancel := context.WithTimeout(ctx, dht.rtRefreshQueryTimeout)
 		defer cancel()
 		err := f(queryCtx)
 		if err == context.DeadlineExceeded && queryCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
@@ -163,22 +201,61 @@ func (dht *IpfsDHT) runBootstrap(ctx context.Context, cfg BootstrapConfig) error
 		return err
 	}
 
-	// Do all but one of the bootstrap queries as random walks.
-	for i := 0; i < cfg.Queries; i++ {
-		err := doQuery(i, "random ID", dht.randomWalk)
+	trackedCpls := dht.routingTable.GetTrackedCplsForRefresh()
+
+	var merr error
+	for cpl, lastRefreshedAt := range trackedCpls {
+		if time.Since(lastRefreshedAt) <= dht.rtRefreshInterval {
+			continue
+		}
+
+		// gen rand peer with the cpl
+		randPeer, err := dht.routingTable.GenRandPeerID(uint(cpl))
 		if err != nil {
+			logger.Errorw("failed to generate peer ID", "cpl", cpl, "error", err)
+			continue
+		}
+
+		// walk to the generated peer
+		walkFnc := func(c context.Context) error {
+			_, err := dht.GetClosestPeers(c, string(randPeer))
 			return err
 		}
+
+		if err := doQuery(uint(cpl), randPeer.String(), walkFnc); err != nil {
+			merr = multierror.Append(
+				merr,
+				fmt.Errorf("failed to do a random walk for cpl %d: %w", cpl, err),
+			)
+		}
 	}
-
-	// Find self to distribute peer info to our neighbors.
-	return doQuery(cfg.Queries, fmt.Sprintf("self: %s", dht.self), dht.selfWalk)
+	return merr
 }
 
-func (dht *IpfsDHT) BootstrapRandom(ctx context.Context) error {
-	return dht.randomWalk(ctx)
+// Bootstrap tells the DHT to get into a bootstrapped state satisfying the
+// IpfsRouter interface.
+func (dht *IpfsDHT) Bootstrap(_ context.Context) error {
+	// Important: don't block!
+	select {
+	case dht.triggerRtRefresh <- nil:
+	default:
+	}
+	return nil
 }
 
-func (dht *IpfsDHT) BootstrapSelf(ctx context.Context) error {
-	return dht.selfWalk(ctx)
+// RefreshRoutingTable tells the DHT to refresh it's routing tables.
+//
+// The returned channel will block until the refresh finishes, then yield the
+// error and close. The channel is buffered and safe to ignore.
+func (dht *IpfsDHT) RefreshRoutingTable() <-chan error {
+	res := make(chan error, 1)
+	select {
+	// FIXME: this can block. Ideally, we'd return a channel without blocking.
+	// https://github.com/libp2p/go-libp2p-kad-dht/issues/609
+	case dht.triggerRtRefresh <- res:
+	case <-dht.ctx.Done():
+		res <- dht.ctx.Err()
+		close(res)
+	}
+	return res
 }
