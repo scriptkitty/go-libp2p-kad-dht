@@ -2,17 +2,21 @@ package dht
 
 import (
 	"fmt"
+	"testing"
 	"time"
 
-	ds "github.com/ipfs/go-datastore"
-	dssync "github.com/ipfs/go-datastore/sync"
-	"github.com/ipfs/go-ipns"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/libp2p/go-libp2p-kad-dht/providers"
+
+	"github.com/libp2p/go-libp2p-kbucket/peerdiversity"
 	record "github.com/libp2p/go-libp2p-record"
+
+	ds "github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/ipfs/go-ipns"
 )
 
 // ModeOpt describes what mode the dht should operate in
@@ -35,19 +39,20 @@ const DefaultPrefix protocol.ID = "/ipfs"
 
 // Options is a structure containing all the options that can be used when constructing a DHT.
 type config struct {
-	datastore        ds.Batching
-	validator        record.Validator
-	validatorChanged bool // if true implies that the validator has been changed and that defaults should not be used
-	mode             ModeOpt
-	protocolPrefix   protocol.ID
-	bucketSize       int
-	concurrency      int
-	resiliency       int
-	maxRecordAge     time.Duration
-	enableProviders  bool
-	enableValues     bool
-	providersOptions []providers.Option
-	queryPeerFilter  QueryFilterFunc
+	datastore          ds.Batching
+	validator          record.Validator
+	validatorChanged   bool // if true implies that the validator has been changed and that defaults should not be used
+	mode               ModeOpt
+	protocolPrefix     protocol.ID
+	v1ProtocolOverride protocol.ID
+	bucketSize         int
+	concurrency        int
+	resiliency         int
+	maxRecordAge       time.Duration
+	enableProviders    bool
+	enableValues       bool
+	providersOptions   []providers.Option
+	queryPeerFilter    QueryFilterFunc
 
 	routingTable struct {
 		refreshQueryTimeout time.Duration
@@ -56,10 +61,14 @@ type config struct {
 		latencyTolerance    time.Duration
 		checkInterval       time.Duration
 		peerFilter          RouteTableFilterFunc
+		diversityFilter     peerdiversity.PeerIPGroupFilter
 	}
 
-	// set to true if we're operating in v1 dht compatible mode
-	v1CompatibleMode bool
+	bootstrapPeers   []peer.AddrInfo
+
+	// test specific config options
+	disableFixLowPeers          bool
+	testAddressUpdateProcessing bool
 }
 
 func emptyQueryFilter(_ *IpfsDHT, ai peer.AddrInfo) bool  { return true }
@@ -119,8 +128,6 @@ var defaults = func(o *config) error {
 	o.bucketSize = defaultBucketSize
 	o.concurrency = 10
 	o.resiliency = 3
-
-	o.v1CompatibleMode = true
 
 	return nil
 }
@@ -269,6 +276,18 @@ func ProtocolExtension(ext protocol.ID) Option {
 	}
 }
 
+// V1ProtocolOverride overrides the protocolID used for /kad/1.0.0 with another. This is an
+// advanced feature, and should only be used to handle legacy networks that have not been
+// using protocolIDs of the form /app/kad/1.0.0.
+//
+// This option will override and ignore the ProtocolPrefix and ProtocolExtension options
+func V1ProtocolOverride(proto protocol.ID) Option {
+	return func(c *config) error {
+		c.v1ProtocolOverride = proto
+		return nil
+	}
+}
+
 // BucketSize configures the bucket size (k in the Kademlia paper) of the routing table.
 //
 // The default value is 20.
@@ -379,17 +398,40 @@ func RoutingTableFilter(filter RouteTableFilterFunc) Option {
 	}
 }
 
-// V1CompatibleMode sets the DHT to operate in V1 compatible mode. In this mode,
-// the DHT node will act like a V1 DHT node (use the V1 protocol names) but will
-// use the V2 query and routing table logic.
-//
-// For now, this option defaults to true for backwards compatibility. In the
-// near future, it will switch to false.
-//
-// This option is perma-unstable and may be removed in the future.
-func V1CompatibleMode(enable bool) Option {
+// BootstrapPeers configures the bootstrapping nodes that we will connect to to seed
+// and refresh our Routing Table if it becomes empty.
+func BootstrapPeers(bootstrappers ...peer.AddrInfo) Option {
 	return func(c *config) error {
-		c.v1CompatibleMode = enable
+		c.bootstrapPeers = bootstrappers
+		return nil
+	}
+}
+
+// RoutingTablePeerDiversityFilter configures the implementation of the `PeerIPGroupFilter` that will be used
+// to construct the diversity filter for the Routing Table.
+// Please see the docs for `peerdiversity.PeerIPGroupFilter` AND `peerdiversity.Filter` for more details.
+func RoutingTablePeerDiversityFilter(pg peerdiversity.PeerIPGroupFilter) Option {
+	return func(c *config) error {
+		c.routingTable.diversityFilter = pg
+		return nil
+	}
+}
+
+// disableFixLowPeersRoutine disables the "fixLowPeers" routine in the DHT.
+// This is ONLY for tests.
+func disableFixLowPeersRoutine(t *testing.T) Option {
+	return func(c *config) error {
+		c.disableFixLowPeers = true
+		return nil
+	}
+}
+
+// forceAddressUpdateProcessing forces the DHT to handle changes to the hosts addresses.
+// This occurs even when AutoRefresh has been disabled.
+// This is ONLY for tests.
+func forceAddressUpdateProcessing(t *testing.T) Option {
+	return func(c *config) error {
+		c.testAddressUpdateProcessing = true
 		return nil
 	}
 }
